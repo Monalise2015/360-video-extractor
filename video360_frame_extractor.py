@@ -30,10 +30,55 @@ import platform
 import threading
 import time
 import argparse
+import bisect
+import logging
+from logging.handlers import RotatingFileHandler
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ═══════════════════════════════════════════════
+# LOGGING — File logger del módulo (additivo a callbacks GUI/CLI)
+# ═══════════════════════════════════════════════
+logger = logging.getLogger("video360_extractor")
+logger.setLevel(logging.DEBUG)
+logger.propagate = False  # No interferir con loggers raíz si la app se importa
+
+# Mapeo niveles del callback "level" -> logging level
+_LEVEL_MAP = {
+    "ok":   logging.INFO,
+    "info": logging.INFO,
+    "step": logging.INFO,
+    "warn": logging.WARNING,
+    "err":  logging.ERROR,
+}
+
+
+def _attach_file_logger(output_dir):
+    """Adjunta un RotatingFileHandler al logger del módulo dentro de output_dir.
+    Idempotente: si ya hay handler para esa ruta, no duplica.
+    """
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        log_path = os.path.join(output_dir, "_extractor.log")
+        # Evitar duplicar handler para el mismo archivo
+        for h in logger.handlers:
+            if getattr(h, "baseFilename", None) == os.path.abspath(log_path):
+                return log_path
+        fh = RotatingFileHandler(
+            log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        )
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s | %(levelname)-7s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logger.addHandler(fh)
+        return log_path
+    except Exception:
+        # Si falla el log, no bloquear la ejecución
+        return None
 
 # ═══════════════════════════════════════════════
 # AUTO-INSTALL DE DEPENDENCIAS
@@ -625,8 +670,7 @@ def get_heading_at_time(heading_map, video_time_ms):
     if not heading_map:
         return None
     keys = sorted(heading_map.keys())
-    # Búsqueda binaria para el timestamp más cercano
-    import bisect
+    # Búsqueda binaria para el timestamp más cercano (bisect importado a nivel módulo)
     idx = bisect.bisect_left(keys, video_time_ms)
     if idx == 0:
         return heading_map[keys[0]]
@@ -801,6 +845,7 @@ def smooth_bearings(frames_data, window=5):
 
 
 def interpolate_gps(timestamp_ms, track):
+    """Interpola posición GPS en `timestamp_ms`. Búsqueda binaria O(log n)."""
     if not track:
         return None
     if timestamp_ms <= track[0]["time_ms"]:
@@ -811,18 +856,26 @@ def interpolate_gps(timestamp_ms, track):
         p = track[-1]
         return {"lat": p["lat"], "lon": p["lon"], "alt": p["alt"], "yaw": 0, "ok": True,
                 "dist_ms": timestamp_ms - track[-1]["time_ms"]}
-    for i in range(len(track) - 1):
-        a, b = track[i], track[i + 1]
-        if a["time_ms"] <= timestamp_ms <= b["time_ms"]:
-            dt = b["time_ms"] - a["time_ms"]
-            ratio = (timestamp_ms - a["time_ms"]) / dt if dt else 0
-            lat = a["lat"] + (b["lat"] - a["lat"]) * ratio
-            lon = a["lon"] + (b["lon"] - a["lon"]) * ratio
-            alt = a["alt"] + (b["alt"] - a["alt"]) * ratio
-            yaw = bearing(a["lat"], a["lon"], b["lat"], b["lon"])
-            return {"lat": round(lat, 7), "lon": round(lon, 7),
-                    "alt": round(alt, 1), "yaw": round(yaw, 1), "ok": True, "dist_ms": 0}
-    return None
+    # Búsqueda binaria: encontrar el par (lo, hi=lo+1) tal que lo es el último índice
+    # con track[lo]["time_ms"] < timestamp_ms. Si timestamp_ms coincide exacto con un
+    # punto track[k], devuelve par (k-1, k) — equivalente al recorrido lineal previo,
+    # de modo que bearing(a, b) sea idéntico al comportamiento O(n) original.
+    lo, hi = 0, len(track) - 1
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if track[mid]["time_ms"] < timestamp_ms:
+            lo = mid
+        else:
+            hi = mid
+    a, b = track[lo], track[hi]
+    dt = b["time_ms"] - a["time_ms"]
+    ratio = (timestamp_ms - a["time_ms"]) / dt if dt else 0
+    lat = a["lat"] + (b["lat"] - a["lat"]) * ratio
+    lon = a["lon"] + (b["lon"] - a["lon"]) * ratio
+    alt = a["alt"] + (b["alt"] - a["alt"]) * ratio
+    yaw = bearing(a["lat"], a["lon"], b["lat"], b["lon"])
+    return {"lat": round(lat, 7), "lon": round(lon, 7),
+            "alt": round(alt, 1), "yaw": round(yaw, 1), "ok": True, "dist_ms": 0}
 
 
 def shift_coordinate(lat, lon, brng_degrees, distance_meters):
@@ -885,13 +938,16 @@ def _to_rational(value):
 
 
 def inject_gps_exif(filepath, lat, lon, alt=None, yaw=None):
-    """Inyecta GPS en EXIF. Thread-safe."""
+    """Inyecta GPS en EXIF. Thread-safe.
+    Errores se registran en el log de archivo (DEBUG) sin saturar la GUI.
+    """
     if not HAS_PIEXIF:
         return False
     try:
         try:
             exif_dict = piexif.load(filepath)
-        except Exception:
+        except Exception as e:
+            logger.debug("piexif.load falló para %s (%s) — usando dict vacío", filepath, e)
             exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
         gps = exif_dict.get("GPS", {})
         gps[piexif.GPSIFD.GPSLatitudeRef] = b"N" if lat >= 0 else b"S"
@@ -908,7 +964,8 @@ def inject_gps_exif(filepath, lat, lon, alt=None, yaw=None):
         exif_bytes = piexif.dump(exif_dict)
         piexif.insert(exif_bytes, filepath)
         return True
-    except Exception:
+    except Exception as e:
+        logger.debug("inject_gps_exif falló para %s: %s", filepath, e)
         return False
 
 
@@ -980,6 +1037,30 @@ class FrameExtractor:
 
     def _run_pipeline(self):
         t0 = time.time()
+
+        # ── Setup file logger (escribe en <output_dir>/_extractor.log) ──
+        # Hook el callback on_log para que cada mensaje vaya tanto a GUI/CLI como al archivo.
+        log_path = _attach_file_logger(self.output_dir)
+        _user_on_log = self.on_log
+
+        def _logged_on_log(msg, level="info"):
+            try:
+                logger.log(_LEVEL_MAP.get(level, logging.INFO), msg)
+            except Exception:
+                pass
+            _user_on_log(msg, level)
+
+        self.on_log = _logged_on_log
+
+        if log_path:
+            self.on_log(f"Log: {log_path}", "info")
+        self.on_log("=" * 55, "step")
+        self.on_log(f"Video 360 Extractor v{VERSION} — Pipeline iniciado", "step")
+        self.on_log(f"  Video:  {self.video_path}", "info")
+        self.on_log(f"  GPX:    {self.gpx_path}", "info")
+        self.on_log(f"  Output: {self.output_dir}", "info")
+        if self.insv_path:
+            self.on_log(f"  INSV:   {self.insv_path}", "info")
 
         # ── FFmpeg ──
         if not self.ffmpeg_path:
@@ -1064,12 +1145,17 @@ class FrameExtractor:
 
         try:
             process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            stderr_tail = []  # Últimas líneas para diagnóstico si FFmpeg falla
             for line in process.stderr:
                 if self.cancelled:
                     process.kill()
                     self.on_done(False, "Cancelado")
                     return
                 line = line.strip()
+                # Mantener cola de últimas 20 líneas de stderr para diagnóstico
+                stderr_tail.append(line)
+                if len(stderr_tail) > 20:
+                    stderr_tail.pop(0)
                 if "time=" in line and vi["duration"] > 0:
                     try:
                         t_str = line.split("time=")[1].split()[0]
@@ -1080,6 +1166,13 @@ class FrameExtractor:
                     except Exception:
                         pass
             process.wait()
+            if process.returncode != 0:
+                self.on_log(f"FFmpeg salió con código {process.returncode}", "warn")
+                if stderr_tail:
+                    self.on_log("Últimas líneas de FFmpeg stderr:", "warn")
+                    for line in stderr_tail[-5:]:
+                        if line:
+                            self.on_log(f"  {line}", "warn")
         except Exception as e:
             self.on_log(f"Error FFmpeg: {e}", "err")
             self.on_done(False, str(e))
