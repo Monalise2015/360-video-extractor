@@ -331,5 +331,43 @@ class TestComputeImuHeadingGuards:
         assert vfe.compute_imu_heading(imu, []) is None
 
 
+# ═══════════════════════════════════════════════
+# Prefijo de nombre de archivo: sanear caracteres ilegales de Windows
+# (caso real: usuario escribió 'Ballenas 24"' → FFmpeg error -22)
+# ═══════════════════════════════════════════════
+class TestSanitizeFilenamePrefix:
+    def test_elimina_comilla_doble_caso_real(self):
+        """'Ballenas 24\"' (24 pulgadas) rompía FFmpeg en Windows."""
+        assert vfe.sanitize_filename_prefix('Ballenas 24"') == 'Ballenas 24'
+
+    def test_elimina_todos_los_ilegales_windows(self):
+        assert vfe.sanitize_filename_prefix('a<b>c:d"e/f\\g|h?i*j') == 'abcdefghij'
+
+    def test_prefijo_valido_intacto(self):
+        assert vfe.sanitize_filename_prefix('FRAME') == 'FRAME'
+        assert vfe.sanitize_filename_prefix('Ballenas_24') == 'Ballenas_24'
+
+    def test_espacios_internos_se_conservan(self):
+        assert vfe.sanitize_filename_prefix('Tanque 12') == 'Tanque 12'
+
+    def test_recorta_espacios_y_puntos_finales(self):
+        """Windows elimina espacios/puntos finales de los nombres."""
+        assert vfe.sanitize_filename_prefix('Tanque.') == 'Tanque'
+        assert vfe.sanitize_filename_prefix('  Tanque  ') == 'Tanque'
+
+    def test_vacio_o_solo_ilegales_cae_a_FRAME(self):
+        assert vfe.sanitize_filename_prefix('') == 'FRAME'
+        assert vfe.sanitize_filename_prefix('"') == 'FRAME'
+        assert vfe.sanitize_filename_prefix('///') == 'FRAME'
+        assert vfe.sanitize_filename_prefix(None) == 'FRAME'
+
+    def test_extractor_sanitiza_el_prefijo(self):
+        """FrameExtractor guarda el prefijo ya saneado (usado en el patrón FFmpeg)."""
+        ext = vfe.FrameExtractor('v.mp4', 'g.gpx', 'out', prefix='Ballenas 24"')
+        assert ext.prefix == 'Ballenas 24'
+        assert '"' not in ext.prefix
+        assert ext._prefix_input == 'Ballenas 24"'  # se recuerda el original para avisar
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

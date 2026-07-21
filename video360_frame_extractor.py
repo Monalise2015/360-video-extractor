@@ -1041,6 +1041,23 @@ def get_video_info(filepath):
     return info
 
 
+# Caracteres prohibidos en nombres de archivo de Windows: < > : " / \ | ? *
+_ILLEGAL_FILENAME_CHARS = set('<>:"/\\|?*')
+
+
+def sanitize_filename_prefix(prefix):
+    """Quita del prefijo los caracteres ilegales en nombres de archivo de Windows.
+    Caso real: el prefijo 'Ballenas 24"' (24 pulgadas) hacía fallar a FFmpeg con
+    error -22 al intentar crear un archivo con comilla doble. Recorta también
+    espacios/puntos finales (Windows los elimina) y cae a 'FRAME' si queda vacío.
+    """
+    if not prefix:
+        return "FRAME"
+    cleaned = ''.join(c for c in prefix if c not in _ILLEGAL_FILENAME_CHARS and ord(c) >= 32)
+    cleaned = cleaned.strip().rstrip(' .')
+    return cleaned or "FRAME"
+
+
 def _to_rational(value):
     d = int(abs(value))
     m_float = (abs(value) - d) * 60
@@ -1110,7 +1127,8 @@ class FrameExtractor:
         self.interval = interval
         self.quality = quality
         self.resolution = resolution
-        self.prefix = prefix
+        self._prefix_input = prefix
+        self.prefix = sanitize_filename_prefix(prefix)
         self.start_time = start_time
         self.offset = offset
         self.tolerance = tolerance
@@ -1176,6 +1194,9 @@ class FrameExtractor:
         self.on_log(f"  Output: {self.output_dir}", "info")
         if self.insv_path:
             self.on_log(f"  INSV:   {self.insv_path}", "info")
+        if self._prefix_input and self.prefix != self._prefix_input:
+            self.on_log(f"Prefijo '{self._prefix_input}' tiene caracteres inválidos para "
+                        f"nombre de archivo → se usa '{self.prefix}'", "warn")
 
         # ── FFmpeg ──
         if not self.ffmpeg_path:
