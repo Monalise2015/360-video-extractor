@@ -1636,10 +1636,13 @@ def run_gui():
     tk.Label(c1, text="① ARCHIVOS DE ENTRADA", bg=BG2, fg=ACCENT, font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(10,4))
 
     def pick_video():
-        f = filedialog.askopenfilename(title="Video 360°", filetypes=[("Video","*.mp4 *.mov *.insv *.MP4 *.MOV"),("Todos","*.*")])
+        f = filedialog.askopenfilename(title="Video 360°", filetypes=[("Video","*.mp4 *.mov *.insv *.MP4 *.MOV *.INSV"),("Todos","*.*")])
         if f:
             var_video.set(f); lv.config(text=os.path.basename(f), fg=GREEN)
             if not var_output.get(): var_output.set(os.path.join(os.path.dirname(f), f"frames_{Path(f).stem}"))
+            # Un .insv como video aporta también giroscopio + GPS embebido
+            if f.lower().endswith(".insv") and not var_insv.get():
+                var_insv.set(f); li.config(text=os.path.basename(f) + " (auto)", fg=GREEN)
 
     def pick_gpx():
         f = filedialog.askopenfilename(title="Track GPX", filetypes=[("GPX","*.gpx *.GPX"),("Todos","*.*")])
@@ -1653,7 +1656,7 @@ def run_gui():
     rf = tk.Frame(c1, bg=BG2); rf.pack(fill="x", padx=12, pady=6)
     # Video
     fv = tk.Frame(rf, bg=BG2); fv.pack(side="left", fill="x", expand=True, padx=(0,6))
-    tk.Label(fv, text="Video 360° (.mp4)", bg=BG2, fg=GRAY, font=("Consolas", 9)).pack(anchor="w")
+    tk.Label(fv, text="Video 360° (.mp4 / .insv)", bg=BG2, fg=GRAY, font=("Consolas", 9)).pack(anchor="w")
     tk.Button(fv, text="🎬  Seleccionar video…", bg=BG3, fg=FG, bd=0, font=("Segoe UI",10), cursor="hand2", padx=12, pady=6, command=pick_video).pack(fill="x", pady=2)
     lv = tk.Label(fv, text="Sin archivo", bg=BG2, fg=GRAY, font=("Consolas",9)); lv.pack(anchor="w")
     # GPX
@@ -1664,9 +1667,14 @@ def run_gui():
 
     # INSV (opcional — giroscopio)
     def pick_insv():
-        f = filedialog.askopenfilename(title="Archivo INSV (giroscopio)", filetypes=[("INSV","*.insv *.INSV"),("Todos","*.*")])
+        f = filedialog.askopenfilename(title="Archivo INSV (giroscopio + GPS)", filetypes=[("INSV","*.insv *.INSV"),("Todos","*.*")])
         if f:
             var_insv.set(f); li.config(text=os.path.basename(f), fg=GREEN)
+            # El INSV también sirve como video: si no hay video, usarlo directo
+            if not var_video.get():
+                var_video.set(f); lv.config(text=os.path.basename(f) + " (desde INSV)", fg=GREEN)
+                if not var_output.get():
+                    var_output.set(os.path.join(os.path.dirname(f), f"frames_{Path(f).stem}"))
 
     ri = tk.Frame(c1, bg=BG2); ri.pack(fill="x", padx=12, pady=(2,6))
     tk.Label(ri, text="📐 Archivo INSV original (opcional — heading del giroscopio + GPS embebido)", bg=BG2, fg=ORANGE, font=("Consolas", 9)).pack(anchor="w")
