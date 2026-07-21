@@ -9,7 +9,7 @@ Extrae frames equirectangulares de videos 360° (Insta360 X5 y similares) e inye
 ## Características
 
 - **Extracción FFmpeg** de frames equirectangulares (5.7K, 4K, 2K) a intervalo configurable
-- **Inyección GPS en EXIF** (latitud, longitud, altitud, heading) desde archivo GPX
+- **Inyección GPS en EXIF** (latitud, longitud, altitud, heading) desde archivo GPX **o desde el GPS embebido del INSV** (sin necesidad de GPX externo)
 - **Heading preciso por giroscopio** leyendo el trailer INSV del archivo Insta360 X5 (fusión Madgwick AHRS + anclaje GPS continuo)
 - **Heading fallback por GPS bearing** suavizado con ventana Gaussiana cuando no hay INSV
 - **Extracción rectilínea** opcional: convierte panoramas 360° en N vistas tipo "drone" (configurable yaw + pitch + FOV)
@@ -55,6 +55,9 @@ Selecciona el video MP4, el track GPX y opcionalmente el archivo INSV original (
 # Básico — extrae frame cada 2 segundos, calidad alta, resolución original
 python video360_frame_extractor.py recorrido.mp4 track.gpx
 
+# Sin GPX — usa el GPS embebido del INSV como track (y su giroscopio para heading)
+python video360_frame_extractor.py recorrido.mp4 --insv recorrido.insv
+
 # Con todos los parámetros
 python video360_frame_extractor.py recorrido.mp4 track.gpx \
     --interval 2 \
@@ -71,8 +74,8 @@ python video360_frame_extractor.py recorrido.mp4 track.gpx \
 
 | Flag | Default | Descripción |
 |------|---------|-------------|
-| `video` | — | Video 360° (`.mp4`, `.mov`) **[obligatorio]** |
-| `gpx` | — | Track GPS (`.gpx`) **[obligatorio]** |
+| `video` | — | Video 360° (`.mp4`, `.mov`, `.insv`) **[obligatorio]** |
+| `gpx` | — | Track GPS (`.gpx`) — opcional si se pasa `--insv` con GPS embebido |
 | `-i`, `--interval` | `2` | Segundos entre frames (1, 2, 3, 5, 10, 15, 30, 60) |
 | `-q`, `--quality` | `4` | Calidad JPEG (qscale: 2=máxima, 15=baja) |
 | `-r`, `--resolution` | `original` | `original`, `5760x2880`, `3840x1920`, `2048x1024` |
@@ -83,7 +86,7 @@ python video360_frame_extractor.py recorrido.mp4 track.gpx \
 | `--tolerance` | `30` | Segundos máx. fuera del rango GPX antes de marcar "sin GPS" |
 | `--threads` | auto | Hilos para inyección EXIF |
 | `--no-exif` | off | Solo CSV, sin escribir EXIF |
-| `--insv` | none | Archivo `.insv` original para heading por giroscopio |
+| `--insv` | none | Archivo `.insv` original: heading por giroscopio + GPS embebido como track si no hay GPX |
 | `--rectilinear` | off | Activa extracción de vistas tipo drone |
 | `--splits` | `8` | Vistas por frame (8 = cada 45°) |
 | `--fov` | `90` | Campo de visión por vista (grados) |
@@ -115,6 +118,15 @@ El heading (orientación de la cámara) se calcula con la siguiente prioridad:
 2. **GPS bearing suavizado** (fallback): si no hay INSV, se calcula bearing entre puntos GPS consecutivos con ventana Gaussiana y promedio circular forward/backward (70/30).
 
 Nota: El INSV de Insta360 X5 contiene tanto el giroscopio como un GPS independiente al GPX externo. El sistema los correlaciona temporalmente.
+
+## Track GPS: GPX vs GPS embebido del INSV
+
+Prioridad de fuente de coordenadas:
+
+1. **GPX externo** (si se proporciona): normalmente más denso y confiable (teléfono/GPS dedicado).
+2. **GPS embebido del INSV** (fallback automático): la X5 registra muestras a ~10 Hz pero **repitiendo el último fix real** (~0.3–1 Hz efectivos). El extractor deduplica por timestamp y usa los fixes únicos como track. En modo INSV el inicio del video se ancla al primer fix GPS del propio archivo (el `creation_time` del MP4 exportado suele ser la fecha de export, no de grabación).
+
+Advertencia: con mala visibilidad de cielo (cámara sumergida, cubierta, interiores) la X5 congela el fix — el extractor lo detecta, avisa en el log, y el filtro de tolerancia (`--tolerance`, 30 s por defecto) descarta frames lejos de cualquier fix real en vez de inventar coordenadas interpoladas.
 
 ---
 

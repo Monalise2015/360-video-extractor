@@ -77,6 +77,19 @@ class TestInterpolateGpsEdges:
         assert r["yaw"] is not None
         assert min(r["yaw"], 360 - r["yaw"]) < 1.0  # ≈ norte
 
+    def test_dist_ms_refleja_huecos_interiores(self):
+        """Track INSV real (018): huecos de hasta 683s entre fixes. Un frame en
+        medio del hueco NO debe pasar el filtro de tolerancia como si tuviera
+        un fix al lado: dist_ms = distancia temporal al fix más cercano."""
+        track = [
+            {"lat": 40.0, "lon": -3.0, "alt": 0.0, "time_ms": 0},
+            {"lat": 40.001, "lon": -3.0, "alt": 0.0, "time_ms": 700_000},
+        ]
+        r_medio = vfe.interpolate_gps(350_000, track)   # a 350s de ambos fixes
+        assert r_medio["dist_ms"] == 350_000
+        r_cerca = vfe.interpolate_gps(5_000, track)     # a 5s del primer fix
+        assert r_cerca["dist_ms"] == 5_000
+
 
 # ═══════════════════════════════════════════════
 # Fix 2 — smooth_bearings: el fallback de referencia nunca debe
@@ -173,6 +186,58 @@ class TestRunSplitCmd:
         cmd = [sys.executable, "-c", "pass"]
         ok, err = vfe.run_split_cmd(cmd, out)
         assert ok is False
+
+
+# ═══════════════════════════════════════════════
+# Feature 5 — GPS embebido del INSV como track alternativo al GPX
+# Patrones reales de la X5 (D:\Ballenas): muestras a ~10Hz repitiendo
+# el último fix, y tracks congelados (mismo ts en todas las muestras)
+# ═══════════════════════════════════════════════
+class TestInsvGpsToTrack:
+    @staticmethod
+    def _pt(ts, ms, lat, lon, alt=0.0):
+        return {"unix_ts": ts, "ms": ms, "lat": lat, "lon": lon,
+                "alt": alt, "speed": 0.5, "track": 90.0}
+
+    def test_convierte_al_formato_de_track_gpx(self):
+        pts = [self._pt(1784559476, 993, 11.695897, -72.721963, -15.3),
+               self._pt(1784559477, 993, 11.695900, -72.721970, -15.5)]
+        track = vfe.insv_gps_to_track(pts)
+        assert len(track) == 2
+        p = track[0]
+        assert p["time_ms"] == 1784559476993
+        assert p["lat"] == 11.695897
+        assert p["lon"] == -72.721963
+        assert p["alt"] == -15.3
+        # Mismo formato que parse_gpx: interpolate_gps debe funcionar tal cual
+        r = vfe.interpolate_gps(1784559477493, track)
+        assert r["ok"]
+        assert 11.695897 < r["lat"] < 11.695900
+
+    def test_dedupe_muestras_repetidas_10hz(self):
+        """La X5 registra ~10Hz repitiendo el último fix (~1-3Hz reales)."""
+        pts = ([self._pt(100, 500, 11.0, -72.0)] * 3 +
+               [self._pt(101, 500, 11.001, -72.0)] * 3 +
+               [self._pt(102, 500, 11.002, -72.0)] * 4)
+        track = vfe.insv_gps_to_track(pts)
+        assert len(track) == 3
+        assert [p["time_ms"] for p in track] == [100500, 101500, 102500]
+
+    def test_track_congelado_queda_degenerado(self):
+        """Archivo 021 real: 7060 muestras, todas el mismo ts/posición → 1 fix único."""
+        pts = [self._pt(200, 0, 11.6955, -72.7246)] * 50
+        track = vfe.insv_gps_to_track(pts)
+        assert len(track) == 1
+
+    def test_ordena_cronologicamente(self):
+        pts = [self._pt(300, 0, 11.2, -72.0),
+               self._pt(100, 0, 11.0, -72.0),
+               self._pt(200, 0, 11.1, -72.0)]
+        track = vfe.insv_gps_to_track(pts)
+        assert [p["time_ms"] for p in track] == [100000, 200000, 300000]
+
+    def test_vacio(self):
+        assert vfe.insv_gps_to_track([]) == []
 
 
 if __name__ == "__main__":

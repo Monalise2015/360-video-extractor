@@ -451,6 +451,39 @@ def read_insv_gps(filepath, records, log_fn=None):
     return points
 
 
+def insv_gps_to_track(gps_points, log_fn=None):
+    """Convierte el GPS embebido del INSV al mismo formato de track que parse_gpx,
+    para usarlo como fuente de coordenadas cuando no hay archivo GPX.
+
+    La X5 registra a ~10Hz REPITIENDO el último fix GPS (~1-3Hz reales), y en
+    condiciones sin cielo visible puede congelar el fix por completo → se
+    deduplica por timestamp y se ordena cronológicamente.
+    """
+    if log_fn is None:
+        log_fn = lambda msg, lvl: None
+
+    track = []
+    last_ms = None
+    for p in gps_points:
+        t_ms = p["unix_ts"] * 1000 + p.get("ms", 0)
+        if t_ms == last_ms:
+            continue
+        last_ms = t_ms
+        track.append({
+            "lat": p["lat"], "lon": p["lon"], "alt": p.get("alt", 0.0),
+            "time": datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc),
+            "time_ms": t_ms,
+        })
+    track.sort(key=lambda x: x["time_ms"])
+
+    if gps_points:
+        log_fn(f"Track INSV: {len(track)} fixes únicos de {len(gps_points):,} muestras", "info")
+    if len(track) == 1:
+        log_fn("GPS INSV congelado (todas las muestras con el mismo timestamp) — "
+               "todos los frames recibirán la misma coordenada", "warn")
+    return track
+
+
 def compute_imu_heading(imu_data, gps_points=None, log_fn=None):
     """
     Calcula heading absoluto por timestamp usando fusión IMU + anclaje GPS.
@@ -890,8 +923,12 @@ def interpolate_gps(timestamp_ms, track):
     lon = a["lon"] + (b["lon"] - a["lon"]) * ratio
     alt = a["alt"] + (b["alt"] - a["alt"]) * ratio
     yaw = bearing(a["lat"], a["lon"], b["lat"], b["lon"])
+    # dist_ms = distancia temporal al fix real más cercano. En tracks con huecos
+    # grandes (GPS INSV congelado) evita aceptar coordenadas interpoladas
+    # inventadas: el filtro de tolerancia del pipeline las descarta.
+    dist_ms = min(timestamp_ms - a["time_ms"], b["time_ms"] - timestamp_ms)
     return {"lat": round(lat, 7), "lon": round(lon, 7),
-            "alt": round(alt, 1), "yaw": round(yaw, 1), "ok": True, "dist_ms": 0}
+            "alt": round(alt, 1), "yaw": round(yaw, 1), "ok": True, "dist_ms": dist_ms}
 
 
 def shift_coordinate(lat, lon, brng_degrees, distance_meters):
@@ -1053,6 +1090,7 @@ class FrameExtractor:
             self.pitch_angles = [0.0]
         self.ffmpeg_path = find_ffmpeg()
         self.gpx_track = []
+        self.track_source = None  # "gpx" | "insv"
         self.video_info = {}
         self.frames_data = []
         self.heading_map = None  # Heading IMU del INSV (si disponible)
@@ -1092,7 +1130,7 @@ class FrameExtractor:
         self.on_log("=" * 55, "step")
         self.on_log(f"Video 360 Extractor v{VERSION} — Pipeline iniciado", "step")
         self.on_log(f"  Video:  {self.video_path}", "info")
-        self.on_log(f"  GPX:    {self.gpx_path}", "info")
+        self.on_log(f"  GPX:    {self.gpx_path or '(ninguno — se usará el GPS del INSV)'}", "info")
         self.on_log(f"  Output: {self.output_dir}", "info")
         if self.insv_path:
             self.on_log(f"  INSV:   {self.insv_path}", "info")
@@ -1106,22 +1144,11 @@ class FrameExtractor:
         self.on_log(f"FFmpeg: {self.ffmpeg_path}", "ok")
         self.on_log(f"Threads EXIF: {self.max_workers}", "info")
 
-        # ── GPX ──
-        self.on_progress(2, "Parseando GPX…")
-        self.on_log("Parseando GPX…", "step")
-        self.gpx_track = parse_gpx(self.gpx_path)
-        if not self.gpx_track:
-            self.on_done(False, "GPX vacío o sin timestamps")
-            return
-        gpx_dur = (self.gpx_track[-1]["time_ms"] - self.gpx_track[0]["time_ms"]) / 1000
-        self.on_log(f"GPX: {len(self.gpx_track)} pts en {format_time(gpx_dur)}", "ok")
-        self.on_log(f"  {self.gpx_track[0]['time'].strftime('%Y-%m-%d %H:%M:%S')} -> {self.gpx_track[-1]['time'].strftime('%H:%M:%S')}", "info")
-        if self.cancelled: return
-
-        # ── INSV Giroscopio (opcional) ──
+        # ── INSV: giroscopio + GPS embebido (opcional) ──
+        insv_gps = []
         if self.insv_path and os.path.isfile(self.insv_path):
-            self.on_progress(3, "Leyendo giroscopio INSV…")
-            self.on_log("=== GIROSCOPIO INSV ===", "step")
+            self.on_progress(2, "Leyendo INSV…")
+            self.on_log("=== INSV (GIROSCOPIO + GPS) ===", "step")
             try:
                 insv_records = parse_insv_trailer(self.insv_path, self.on_log)
                 if insv_records:
@@ -1137,6 +1164,32 @@ class FrameExtractor:
             except Exception as e:
                 self.on_log(f"Error leyendo INSV: {e}", "warn")
                 self.heading_map = None
+                insv_gps = []
+        if self.cancelled: return
+
+        # ── Track GPS: GPX o, en su defecto, GPS embebido del INSV ──
+        self.on_progress(3, "Preparando track GPS…")
+        if self.gpx_path:
+            self.track_source = "gpx"
+            self.on_log("Parseando GPX…", "step")
+            self.gpx_track = parse_gpx(self.gpx_path)
+            if not self.gpx_track:
+                self.on_done(False, "GPX vacío o sin timestamps")
+                return
+        elif insv_gps:
+            self.track_source = "insv"
+            self.on_log("Sin GPX — usando el GPS embebido del INSV como track", "step")
+            self.gpx_track = insv_gps_to_track(insv_gps, self.on_log)
+            if not self.gpx_track:
+                self.on_done(False, "El GPS embebido del INSV no tiene fixes válidos")
+                return
+        else:
+            self.on_done(False, "Sin track GPS: proporciona un GPX o un INSV con GPS embebido")
+            return
+        src_lbl = "GPX" if self.track_source == "gpx" else "GPS INSV"
+        gpx_dur = (self.gpx_track[-1]["time_ms"] - self.gpx_track[0]["time_ms"]) / 1000
+        self.on_log(f"{src_lbl}: {len(self.gpx_track)} pts en {format_time(gpx_dur)}", "ok")
+        self.on_log(f"  {self.gpx_track[0]['time'].strftime('%Y-%m-%d %H:%M:%S')} -> {self.gpx_track[-1]['time'].strftime('%H:%M:%S')}", "info")
         if self.cancelled: return
 
         # ── Video ──
@@ -1150,6 +1203,12 @@ class FrameExtractor:
         if self.start_time:
             start_ms = int(self.start_time.timestamp() * 1000)
             self.on_log(f"Inicio (manual): {self.start_time.isoformat()}", "info")
+        elif self.track_source == "insv":
+            # Track y video provienen de la MISMA grabación INSV: el primer fix
+            # GPS es la mejor referencia del inicio (el creation_time del MP4
+            # exportado suele ser la fecha de export, no de grabación).
+            start_ms = self.gpx_track[0]["time_ms"]
+            self.on_log(f"Inicio (primer fix GPS del INSV): {self.gpx_track[0]['time'].isoformat()}", "ok")
         elif vi.get("creation_time"):
             start_ms = int(vi["creation_time"].timestamp() * 1000)
             self.on_log(f"Inicio (video): {vi['creation_time'].isoformat()}", "ok")
@@ -1556,7 +1615,7 @@ def run_gui():
     lv = tk.Label(fv, text="Sin archivo", bg=BG2, fg=GRAY, font=("Consolas",9)); lv.pack(anchor="w")
     # GPX
     fg_ = tk.Frame(rf, bg=BG2); fg_.pack(side="left", fill="x", expand=True, padx=(6,0))
-    tk.Label(fg_, text="Track GPS (.gpx)", bg=BG2, fg=GRAY, font=("Consolas", 9)).pack(anchor="w")
+    tk.Label(fg_, text="Track GPS (.gpx — opcional con INSV)", bg=BG2, fg=GRAY, font=("Consolas", 9)).pack(anchor="w")
     tk.Button(fg_, text="🛰  Seleccionar GPX…", bg=BG3, fg=FG, bd=0, font=("Segoe UI",10), cursor="hand2", padx=12, pady=6, command=pick_gpx).pack(fill="x", pady=2)
     lg = tk.Label(fg_, text="Sin archivo", bg=BG2, fg=GRAY, font=("Consolas",9)); lg.pack(anchor="w")
 
@@ -1567,7 +1626,7 @@ def run_gui():
             var_insv.set(f); li.config(text=os.path.basename(f), fg=GREEN)
 
     ri = tk.Frame(c1, bg=BG2); ri.pack(fill="x", padx=12, pady=(2,6))
-    tk.Label(ri, text="📐 Archivo INSV original (opcional — heading preciso del giroscopio)", bg=BG2, fg=ORANGE, font=("Consolas", 9)).pack(anchor="w")
+    tk.Label(ri, text="📐 Archivo INSV original (opcional — heading del giroscopio + GPS embebido)", bg=BG2, fg=ORANGE, font=("Consolas", 9)).pack(anchor="w")
     tk.Button(ri, text="🔧  Seleccionar INSV…", bg=BG3, fg=FG, bd=0, font=("Segoe UI",10), cursor="hand2", padx=12, pady=4, command=pick_insv).pack(fill="x", pady=2)
     li = tk.Label(ri, text="Sin INSV — se usará GPS bearing (menos preciso)", bg=BG2, fg=GRAY, font=("Consolas",9)); li.pack(anchor="w")
     tk.Frame(c1, bg=BG2, height=6).pack()
@@ -1640,7 +1699,8 @@ def run_gui():
 
     def start():
         if not var_video.get(): messagebox.showwarning("","Selecciona un video"); return
-        if not var_gpx.get(): messagebox.showwarning("","Selecciona un GPX"); return
+        if not var_gpx.get() and not var_insv.get():
+            messagebox.showwarning("","Selecciona un GPX, o un INSV con GPS embebido"); return
         if not var_output.get(): var_output.set(os.path.join(os.path.dirname(var_video.get()), f"frames_{Path(var_video.get()).stem}"))
 
         interval = int(var_interval.get())
@@ -1660,7 +1720,7 @@ def run_gui():
         btn_go.config(state="disabled"); btn_stop.config(state="normal")
 
         ext = FrameExtractor(
-            var_video.get(), var_gpx.get(), var_output.get(),
+            var_video.get(), var_gpx.get() or None, var_output.get(),
             interval, quality, resolution, var_prefix.get() or "FRAME",
             start_time, float(var_offset.get() or 0), 30, True,
             int(var_threads.get()),
@@ -1728,9 +1788,11 @@ def run_gui():
 def run_cli():
     print(f"\n{'='*55}\n  VIDEO 360 -> FRAMES GPS - Bureau Veritas v{VERSION} CLI\n{'='*55}\n")
 
-    parser = argparse.ArgumentParser(description="Extrae frames de video 360° con GPS desde GPX.")
-    parser.add_argument("video", help="Video 360° (.mp4, .mov)")
-    parser.add_argument("gpx", help="Track GPS (.gpx)")
+    parser = argparse.ArgumentParser(
+        description="Extrae frames de video 360° con GPS desde GPX o desde el GPS embebido del INSV.")
+    parser.add_argument("video", help="Video 360° (.mp4, .mov, .insv)")
+    parser.add_argument("gpx", nargs="?", default=None,
+                        help="Track GPS (.gpx) — opcional si se pasa --insv con GPS embebido")
     parser.add_argument("-i","--interval", type=int, default=2, choices=[1,2,3,5,10,15,30,60])
     parser.add_argument("-q","--quality", type=int, default=4)
     parser.add_argument("-r","--resolution", default="original")
@@ -1750,7 +1812,12 @@ def run_cli():
     parser.add_argument("--insv", default=None, help="Archivo INSV original para heading preciso del giroscopio")
     args = parser.parse_args()
 
-    for f, n in [(args.video, "Video"), (args.gpx, "GPX")]:
+    if not args.gpx and not args.insv:
+        print("  ✗ Se necesita un GPX o un --insv con GPS embebido"); sys.exit(1)
+    checks = [(args.video, "Video")]
+    if args.gpx: checks.append((args.gpx, "GPX"))
+    if args.insv: checks.append((args.insv, "INSV"))
+    for f, n in checks:
         if not os.path.isfile(f): print(f"  ✗ {n} no encontrado: {f}"); sys.exit(1)
     if not args.output: args.output = f"frames_{Path(args.video).stem}"
 
