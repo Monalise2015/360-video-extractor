@@ -92,6 +92,9 @@ REQUIRED_PACKAGES = {
 
 def auto_install_packages():
     """Instala paquetes pip faltantes automáticamente."""
+    if getattr(sys, "frozen", False):
+        # Ejecutable PyInstaller: dependencias empaquetadas, sys.executable no es Python
+        return True
     missing = []
     for module_name, pip_name in REQUIRED_PACKAGES.items():
         try:
@@ -344,15 +347,58 @@ def read_insv_gyro(filepath, records, log_fn=None):
     rec = records[INSV_REC_GYRO]
     gyro_size = rec['size']
 
-    # Determinar formato: 56 bytes (standard float64) o 20 bytes (raw uint16)
-    if gyro_size % 56 == 0:
-        sample_size = 56
-        is_raw = False
-    elif gyro_size % 20 == 0:
-        sample_size = 20
-        is_raw = True
-    else:
-        log_fn(f"Tamaño de gyro ({gyro_size}) no es múltiplo de 56 ni 20", "err")
+    with open(filepath, 'rb') as f:
+        f.seek(rec['offset'])
+        raw_all = f.read(gyro_size)
+
+    # Escalas por defecto para raw (Insta360 X5)
+    gyro_range = 2000   # deg/s
+    acc_range = 8       # g (X5 parece usar 8g para obtener ~1g de magnitud)
+    gyro_scale = 32768.0 / gyro_range
+    acc_scale = 32768.0 / acc_range
+
+    def _plausible(sample_size, is_raw):
+        """Valida el CONTENIDO del formato candidato: timestamps crecientes
+        (≤100ms entre muestras) y |accel| ≈ 1g. El tamaño no basta: los
+        registros de la X5 suelen ser múltiplos de 280, divisibles por
+        56 Y por 20 a la vez — elegir mal da timestamps de billones de s.
+        """
+        n = gyro_size // sample_size
+        if n < 2:
+            return False
+        k = min(50, n)
+        deltas, mags = [], []
+        prev_ts = None
+        for i in range(k):
+            off = i * sample_size
+            ts = struct.unpack_from('<Q', raw_all, off)[0]
+            if is_raw:
+                vals = struct.unpack_from('<6H', raw_all, off + 8)
+                ax, ay, az = ((v - 32768) / acc_scale for v in vals[:3])
+            else:
+                vals = struct.unpack_from('<6d', raw_all, off + 8)
+                ax, ay, az = vals[0], vals[1], vals[2]
+            if prev_ts is not None:
+                d = ts - prev_ts
+                if d < 0:
+                    return False
+                deltas.append(d)
+            prev_ts = ts
+            m = math.sqrt(ax * ax + ay * ay + az * az)
+            if not math.isfinite(m):
+                return False
+            mags.append(m)
+        med_delta_us = sorted(deltas)[len(deltas) // 2]
+        med_mag = sorted(mags)[len(mags) // 2]
+        return 0 < med_delta_us <= 100_000 and 0.2 <= med_mag <= 4.0
+
+    sample_size = is_raw = None
+    for ss, raw_flag in ((56, False), (20, True)):
+        if gyro_size % ss == 0 and _plausible(ss, raw_flag):
+            sample_size, is_raw = ss, raw_flag
+            break
+    if sample_size is None:
+        log_fn(f"Formato de gyro no reconocido ({gyro_size:,} bytes) — se omite heading IMU", "warn")
         return None
 
     n_samples = gyro_size // sample_size
@@ -361,16 +407,6 @@ def read_insv_gyro(filepath, records, log_fn=None):
     timestamps = np.zeros(n_samples)
     accel = np.zeros((n_samples, 3))
     gyro = np.zeros((n_samples, 3))
-
-    # Escalas por defecto para raw (Insta360 X5)
-    gyro_range = 2000   # deg/s
-    acc_range = 8       # g (X5 parece usar 8g para obtener ~1g de magnitud)
-    gyro_scale = 32768.0 / gyro_range
-    acc_scale = 32768.0 / acc_range
-
-    with open(filepath, 'rb') as f:
-        f.seek(rec['offset'])
-        raw_all = f.read(gyro_size)
 
     for i in range(n_samples):
         off = i * sample_size
@@ -392,6 +428,9 @@ def read_insv_gyro(filepath, records, log_fn=None):
 
     duration = (timestamps[-1] - timestamps[0]) / 1000.0
     rate = n_samples / duration if duration > 0 else 0
+    if rate <= 0:
+        log_fn("Gyro con timestamps inválidos (duración 0) — se omite heading IMU", "warn")
+        return None
     log_fn(f"Gyro: {duration:.1f}s, {rate:.0f}Hz", "ok")
 
     return {
@@ -505,6 +544,9 @@ def compute_imu_heading(imu_data, gps_points=None, log_fn=None):
     gyro_data = imu_data['gyro']
     sample_rate = imu_data['sample_rate']
     n = imu_data['n_samples']
+    if not sample_rate or sample_rate <= 0:
+        log_fn("Sample rate IMU inválido — se omite heading", "warn")
+        return None
 
     # === Paso 1: Fusión AHRS (Madgwick) sin magnetómetro ===
     ahrs = imufusion.Ahrs()
@@ -1162,9 +1204,10 @@ class FrameExtractor:
                         else:
                             self.on_log("No se pudo calcular heading IMU", "warn")
             except Exception as e:
+                # Solo se pierde el heading — el GPS ya leído se conserva
+                # para poder usarlo como track
                 self.on_log(f"Error leyendo INSV: {e}", "warn")
                 self.heading_map = None
-                insv_gps = []
         if self.cancelled: return
 
         # ── Track GPS: GPX o, en su defecto, GPS embebido del INSV ──
@@ -1785,7 +1828,20 @@ def run_gui():
 # ═══════════════════════════════════════════════
 # CLI MODE
 # ═══════════════════════════════════════════════
+def configure_console_utf8():
+    """Reconfigura stdout/stderr a UTF-8 con errors='replace'.
+    Las consolas Windows legacy (cp1252/cp850) no codifican los símbolos
+    ●✓⚠✗█░ del CLI y matarían el pipeline en el primer print.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def run_cli():
+    configure_console_utf8()
     print(f"\n{'='*55}\n  VIDEO 360 -> FRAMES GPS - Bureau Veritas v{VERSION} CLI\n{'='*55}\n")
 
     parser = argparse.ArgumentParser(

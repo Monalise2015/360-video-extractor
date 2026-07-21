@@ -240,5 +240,96 @@ class TestInsvGpsToTrack:
         assert vfe.insv_gps_to_track([]) == []
 
 
+# ═══════════════════════════════════════════════
+# Ejecutable congelado (PyInstaller): sin auto-install de pip
+# ═══════════════════════════════════════════════
+class TestFrozenExecutable:
+    def test_auto_install_se_salta_en_exe_congelado(self, monkeypatch):
+        """En un .exe de PyInstaller las dependencias van empaquetadas y
+        sys.executable no es Python: jamás debe invocarse pip."""
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setitem(vfe.REQUIRED_PACKAGES, "modulo_inexistente_xyz", "paquete-fantasma")
+        llamadas = []
+        monkeypatch.setattr(vfe.subprocess, "check_call",
+                            lambda *a, **k: llamadas.append(a))
+        assert vfe.auto_install_packages() is True
+        assert llamadas == [], "auto_install invocó pip dentro de un exe congelado"
+
+
+class TestConsoleUtf8:
+    def test_simbolos_no_revientan_en_consola_cp1252(self, monkeypatch):
+        """Consolas Windows legacy (cp1252/cp850) no codifican ●✓✗█ — el CLI
+        debe reconfigurar stdout para no morir en el primer log."""
+        import io
+        buf = io.BytesIO()
+        fake_stdout = io.TextIOWrapper(buf, encoding="cp1252")
+        monkeypatch.setattr(sys, "stdout", fake_stdout)
+        vfe.configure_console_utf8()
+        print("  ● [12:00:00] ✓ █░ ✗ FALLÓ")   # no debe lanzar UnicodeEncodeError
+        sys.stdout.flush()
+        assert buf.getvalue()  # algo se escribió
+
+
+# ═══════════════════════════════════════════════
+# Gyro INSV: detección de formato por CONTENIDO, no solo por tamaño
+# (los registros de la X5 son múltiplos de 280 → divisibles por 56 Y 20)
+# ═══════════════════════════════════════════════
+class TestInsvGyroFormatDetection:
+    @staticmethod
+    def _gyro_file(tmp_path, blob):
+        p = tmp_path / "gyro.bin"
+        p.write_bytes(blob)
+        records = {vfe.INSV_REC_GYRO: {"size": len(blob), "offset": 0,
+                                       "format": 0, "extra_start": 0}}
+        return str(p), records
+
+    def test_detecta_raw_20B_aunque_divisible_por_56(self, tmp_path):
+        """Caso real X5 (archivo 026): interpretar el registro raw como float64
+        daba duración de 9.2e12 s → rate 0 Hz → division by zero."""
+        import struct as st
+        n = 1400  # 28000 bytes: divisible por 56 y por 20
+        blob = bytearray()
+        for i in range(n):
+            blob += st.pack("<Q", 1_000_000 + i * 1000)      # µs, 1 kHz
+            blob += st.pack("<6H", 32768, 32768, 32768 + 4096,  # accel (0,0,1g) @8g
+                            32768, 32768, 32768)                # gyro 0 °/s
+        path, records = self._gyro_file(tmp_path, bytes(blob))
+        imu = vfe.read_insv_gyro(path, records)
+        assert imu is not None
+        assert imu["n_samples"] == n
+        assert 900 <= imu["sample_rate"] <= 1100
+
+    def test_detecta_float_56B_valido(self, tmp_path):
+        import struct as st
+        n = 500  # 28000 bytes: también divisible por ambos
+        blob = bytearray()
+        for i in range(n):
+            blob += st.pack("<Q", 2_000_000 + i * 1000)
+            blob += st.pack("<6d", 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+        path, records = self._gyro_file(tmp_path, bytes(blob))
+        imu = vfe.read_insv_gyro(path, records)
+        assert imu is not None
+        assert imu["n_samples"] == n
+        assert 900 <= imu["sample_rate"] <= 1100
+
+    def test_timestamps_congelados_retorna_none(self, tmp_path):
+        """Duración 0 debe dar None (sin heading), nunca division by zero."""
+        import struct as st
+        blob = bytearray()
+        for _ in range(100):  # 2000 bytes: solo divisible por 20
+            blob += st.pack("<Q", 5_000_000)
+            blob += st.pack("<6H", 32768, 32768, 36864, 32768, 32768, 32768)
+        path, records = self._gyro_file(tmp_path, bytes(blob))
+        assert vfe.read_insv_gyro(path, records) is None
+
+
+class TestComputeImuHeadingGuards:
+    def test_sample_rate_cero_no_divide_por_cero(self):
+        import numpy as np
+        imu = {"timestamps_ms": np.array([0.0, 0.0]), "accel": np.zeros((2, 3)),
+               "gyro": np.zeros((2, 3)), "sample_rate": 0, "n_samples": 2}
+        assert vfe.compute_imu_heading(imu, []) is None
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

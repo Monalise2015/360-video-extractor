@@ -13,3 +13,4 @@ output/
 *.gpx
 .vscode/
 .idea/
+*.spec
