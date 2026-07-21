@@ -748,6 +748,20 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
+def gpx_video_overlap(video_start_ms, video_end_ms, track):
+    """Solapamiento temporal entre la ventana del video y el track GPX.
+    Retorna (segundos_solapados, fracción_del_video_cubierta).
+    Detecta el caso típico: creation_time del MP4 = fecha de EXPORT
+    (Insta360 Studio), no de grabación → 0 frames con GPS silenciosos.
+    """
+    if not track or video_end_ms <= video_start_ms:
+        return 0.0, 0.0
+    overlap_ms = min(video_end_ms, track[-1]["time_ms"]) - max(video_start_ms, track[0]["time_ms"])
+    if overlap_ms <= 0:
+        return 0.0, 0.0
+    return overlap_ms / 1000.0, overlap_ms / (video_end_ms - video_start_ms)
+
+
 def smooth_bearings(frames_data, window=5):
     """
     Recalcula bearings suavizados usando ventana Gaussiana sobre coordenadas.
@@ -800,36 +814,36 @@ def smooth_bearings(frames_data, window=5):
             smooth_lons[i] = lon_acc / total_w
 
     # --- Etapa 2: Calcular bearings desde coords suavizadas ---
-    # Buscar referencia forward/backward con distancia minima de 1m
-    def find_fwd_ref(i):
-        for j in range(i + 1, n):
-            if not frames_data[j]['has_gps'] or smooth_lats[j] == 0:
-                continue
+    # Buscar referencia forward/backward con distancia minima de 1m.
+    # IMPORTANTE: solo entre frames CON GPS — un fallback a un frame sin GPS
+    # (lat=0, lon=0) daría un bearing absurdo hacia el golfo de Guinea.
+    def find_fwd_ref(k):
+        i = gps_indices[k]
+        for j in gps_indices[k + 1:]:
             if haversine(smooth_lats[i], smooth_lons[i], smooth_lats[j], smooth_lons[j]) >= 1.0:
                 return j
-        return min(i + 1, n - 1)
+        return gps_indices[k + 1] if k + 1 < len(gps_indices) else i
 
-    def find_bwd_ref(i):
-        for j in range(i - 1, -1, -1):
-            if not frames_data[j]['has_gps'] or smooth_lats[j] == 0:
-                continue
+    def find_bwd_ref(k):
+        i = gps_indices[k]
+        for j in reversed(gps_indices[:k]):
             if haversine(smooth_lats[i], smooth_lons[i], smooth_lats[j], smooth_lons[j]) >= 1.0:
                 return j
-        return max(i - 1, 0)
+        return gps_indices[k - 1] if k > 0 else i
 
-    for i in gps_indices:
-        if i == gps_indices[0]:
+    for k, i in enumerate(gps_indices):
+        if k == 0:
             # Primer frame: solo bearing forward
-            ref = find_fwd_ref(i)
+            ref = find_fwd_ref(k)
             new_yaw = bearing(smooth_lats[i], smooth_lons[i], smooth_lats[ref], smooth_lons[ref])
-        elif i == gps_indices[-1]:
+        elif k == len(gps_indices) - 1:
             # Último frame: solo bearing backward
-            ref = find_bwd_ref(i)
+            ref = find_bwd_ref(k)
             new_yaw = bearing(smooth_lats[ref], smooth_lons[ref], smooth_lats[i], smooth_lons[i])
         else:
             # Intermedio: promedio circular forward + backward
-            prev = find_bwd_ref(i)
-            nxt = find_fwd_ref(i)
+            prev = find_bwd_ref(k)
+            nxt = find_fwd_ref(k)
             b1 = bearing(smooth_lats[prev], smooth_lons[prev], smooth_lats[i], smooth_lons[i])
             b2 = bearing(smooth_lats[i], smooth_lons[i], smooth_lats[nxt], smooth_lons[nxt])
             # Promedio circular ponderado: 70% forward, 30% backward
@@ -840,6 +854,7 @@ def smooth_bearings(frames_data, window=5):
             new_yaw = (math.degrees(math.atan2(sin_avg, cos_avg)) + 360) % 360
 
         frames_data[i]['yaw'] = round(new_yaw, 1)
+        frames_data[i]['has_heading'] = True
 
     return frames_data
 
@@ -850,11 +865,12 @@ def interpolate_gps(timestamp_ms, track):
         return None
     if timestamp_ms <= track[0]["time_ms"]:
         p = track[0]
-        return {"lat": p["lat"], "lon": p["lon"], "alt": p["alt"], "yaw": 0, "ok": True,
+        # yaw=None: fuera del track no hay dirección de movimiento conocida
+        return {"lat": p["lat"], "lon": p["lon"], "alt": p["alt"], "yaw": None, "ok": True,
                 "dist_ms": track[0]["time_ms"] - timestamp_ms}
     if timestamp_ms >= track[-1]["time_ms"]:
         p = track[-1]
-        return {"lat": p["lat"], "lon": p["lon"], "alt": p["alt"], "yaw": 0, "ok": True,
+        return {"lat": p["lat"], "lon": p["lon"], "alt": p["alt"], "yaw": None, "ok": True,
                 "dist_ms": timestamp_ms - track[-1]["time_ms"]}
     # Búsqueda binaria: encontrar el par (lo, hi=lo+1) tal que lo es el último índice
     # con track[lo]["time_ms"] < timestamp_ms. Si timestamp_ms coincide exacto con un
@@ -893,6 +909,24 @@ def shift_coordinate(lat, lon, brng_degrees, distance_meters):
                              math.cos(distance_meters / R) - math.sin(lat1) * math.sin(lat2))
     
     return round(math.degrees(lat2), 7), round(math.degrees(lon2), 7)
+
+
+def run_split_cmd(cmd, out_path):
+    """Ejecuta un comando FFmpeg de split y verifica que produjo la salida.
+    Retorna (ok, stderr). Detecta builds de FFmpeg sin filtro v360, fallos
+    de CUDA, etc., que antes fallaban en silencio.
+    """
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True)
+        stderr = (result.stderr or "").strip()
+        if result.returncode != 0:
+            return False, stderr or f"FFmpeg salió con código {result.returncode}"
+        if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+            return False, stderr or "FFmpeg no produjo el archivo de salida"
+        return True, stderr
+    except Exception as e:
+        return False, str(e)
 
 
 def get_video_info(filepath):
@@ -957,7 +991,8 @@ def inject_gps_exif(filepath, lat, lon, alt=None, yaw=None):
         if alt is not None:
             gps[piexif.GPSIFD.GPSAltitudeRef] = 0 if alt >= 0 else 1
             gps[piexif.GPSIFD.GPSAltitude] = (int(abs(alt) * 100), 100)
-        if yaw is not None and yaw != 0:
+        # yaw=None significa "heading desconocido"; 0.0 es norte y SÍ se escribe
+        if yaw is not None:
             gps[piexif.GPSIFD.GPSImgDirectionRef] = b"T"
             gps[piexif.GPSIFD.GPSImgDirection] = (int(yaw * 100), 100)
         exif_dict["GPS"] = gps
@@ -1125,6 +1160,25 @@ class FrameExtractor:
         if self.offset:
             self.on_log(f"Offset: {self.offset:+.1f}s", "info")
 
+        # ── Sanidad: ¿el video y el GPX se solapan en el tiempo? ──
+        if vi["duration"]:
+            video_end_ms = start_ms + int(vi["duration"] * 1000)
+            ov_secs, ov_ratio = gpx_video_overlap(start_ms, video_end_ms, self.gpx_track)
+            if ov_ratio <= 0:
+                v0 = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+                v1 = datetime.fromtimestamp(video_end_ms / 1000, tz=timezone.utc)
+                self.on_log("⚠ EL VIDEO Y EL GPX NO SE SOLAPAN EN EL TIEMPO", "err")
+                self.on_log(f"  Video: {v0.strftime('%Y-%m-%d %H:%M:%S')} → {v1.strftime('%H:%M:%S')} UTC", "warn")
+                self.on_log(f"  GPX:   {self.gpx_track[0]['time'].strftime('%Y-%m-%d %H:%M:%S')} → "
+                            f"{self.gpx_track[-1]['time'].strftime('%H:%M:%S')}", "warn")
+                self.on_log("  Causa típica: el creation_time del MP4 es la fecha de EXPORT "
+                            "(Insta360 Studio), no de grabación.", "warn")
+                self.on_log("  Solución: fija 'Inicio video' (GUI) o --start/--offset (CLI). "
+                            "Ningún frame recibirá GPS así.", "warn")
+            elif ov_ratio < 0.5:
+                self.on_log(f"⚠ Solo {ov_ratio*100:.0f}% del video se solapa con el GPX "
+                            f"({ov_secs:.0f}s) — muchos frames quedarán sin GPS", "warn")
+
         if vi["duration"]:
             est = int(vi["duration"] / self.interval)
             self.on_log(f"Estimación: ~{est} frames", "info")
@@ -1207,16 +1261,22 @@ class FrameExtractor:
             frame_ms = start_ms + frame_sec * 1000
             gps = interpolate_gps(frame_ms, self.gpx_track)
             has_gps = False
+            has_heading = False
             lat = lon = alt = yaw = 0
             if gps and gps["ok"] and gps.get("dist_ms", 0)/1000 <= self.tolerance:
                 has_gps = True
-                lat, lon, alt, yaw = gps["lat"], gps["lon"], gps["alt"], gps["yaw"]
+                lat, lon, alt = gps["lat"], gps["lon"], gps["alt"]
+                # yaw=None en extremos del track: coordenada válida, heading desconocido
+                if gps["yaw"] is not None:
+                    yaw = gps["yaw"]
+                    has_heading = True
                 with_gps += 1
             original_frames_data.append({
                 "index": idx+1, "filename": os.path.basename(fpath),
                 "filepath": fpath, "time_sec": frame_sec,
                 "time_str": format_time(frame_sec),
-                "lat": lat, "lon": lon, "alt": alt, "yaw": yaw, "has_gps": has_gps
+                "lat": lat, "lon": lon, "alt": alt, "yaw": yaw,
+                "has_gps": has_gps, "has_heading": has_heading
             })
 
         # ── Heading: IMU del giroscopio (preciso) o GPS bearing suavizado (fallback) ──
@@ -1234,6 +1294,7 @@ class FrameExtractor:
                 imu_heading = get_heading_at_time(self.heading_map, frame_video_ms)
                 if imu_heading is not None:
                     fd['yaw'] = imu_heading
+                    fd['has_heading'] = True
                     fd['heading_source'] = 'imu'
                     imu_assigned += 1
             self.on_log(f"Heading IMU asignado a {imu_assigned}/{len(original_frames_data)} frames ✓", "ok")
@@ -1276,13 +1337,14 @@ class FrameExtractor:
                 cmd += ["-i", fd['filepath']]
                 
                 cmd += ["-vf", filter_str, "-q:v", str(self.quality), out_path]
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                
+                split_ok, split_err = run_split_cmd(cmd, out_path)
+
                 return {
                     "index": fd["index"], "filename": out_name, "filepath": out_path,
                     "time_sec": fd["time_sec"], "time_str": fd["time_str"],
-                    "lat": shift_lat, "lon": shift_lon, "alt": fd["alt"], "yaw": abs_yaw, 
-                    "has_gps": fd["has_gps"]
+                    "lat": shift_lat, "lon": shift_lon, "alt": fd["alt"], "yaw": abs_yaw,
+                    "has_gps": fd["has_gps"], "has_heading": fd.get("has_heading", False),
+                    "split_ok": split_ok, "split_err": split_err
                 }
 
             splits_to_do = []
@@ -1292,6 +1354,7 @@ class FrameExtractor:
                         angle = (360 / self.splits) * s
                         splits_to_do.append((fd, s, angle, pitch))
             
+            split_errors = []
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = {executor.submit(process_split, *args): args for args in splits_to_do}
                 done_count = 0
@@ -1300,11 +1363,26 @@ class FrameExtractor:
                     if self.cancelled:
                         executor.shutdown(wait=False, cancel_futures=True)
                         return
-                    rect_frames_data.append(future.result())
+                    res = future.result()
+                    if res.pop("split_ok"):
+                        res.pop("split_err", None)
+                        rect_frames_data.append(res)
+                    else:
+                        split_errors.append(f"{res['filename']}: {res['split_err']}")
                     done_count += 1
                     if done_count % 10 == 0 or done_count == total_splits:
                         pct = 65 + int((done_count / max(total_splits, 1)) * 6)
                         self.on_progress(pct, f"Splits: {done_count}/{total_splits}")
+
+            if split_errors:
+                self.on_log(f"⚠ {len(split_errors)}/{total_splits} splits fallaron", "warn")
+                self.on_log(f"  Primer error: {split_errors[0][:300]}", "warn")
+                if not rect_frames_data:
+                    self.on_log("Todos los splits fallaron — se conservan los frames "
+                                "equirectangulares originales", "err")
+                    self.on_done(False, "Splits rectilíneos fallaron "
+                                        "(¿FFmpeg sin filtro v360, o CUDA no disponible?)")
+                    return
 
             for fd in original_frames_data:
                try: os.remove(fd["filepath"])
@@ -1329,7 +1407,10 @@ class FrameExtractor:
             total_gps = len(gps_frames)
 
             def _inject_one(fd):
-                return inject_gps_exif(fd["filepath"], fd["lat"], fd["lon"], fd["alt"], fd["yaw"])
+                # Sin heading conocido → None (no escribir GPSImgDirection);
+                # con heading, incluso 0.0 (norte) se escribe.
+                yaw = fd["yaw"] if fd.get("has_heading") else None
+                return inject_gps_exif(fd["filepath"], fd["lat"], fd["lon"], fd["alt"], yaw)
 
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = {executor.submit(_inject_one, fd): fd for fd in gps_frames}
