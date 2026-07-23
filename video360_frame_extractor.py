@@ -80,6 +80,19 @@ def _attach_file_logger(output_dir):
         # Si falla el log, no bloquear la ejecución
         return None
 
+def configure_console_utf8():
+    """Reconfigura stdout/stderr a UTF-8 con errors='replace'.
+    Las consolas Windows legacy (cp1252/cp850) no codifican los símbolos
+    ●✓⚠✗█░ y matarían el proceso en el primer print — incluido el error
+    de auto-install, que corre en el import antes de abrir GUI o CLI.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 # ═══════════════════════════════════════════════
 # AUTO-INSTALL DE DEPENDENCIAS
 # ═══════════════════════════════════════════════
@@ -90,11 +103,41 @@ REQUIRED_PACKAGES = {
     "imufusion": "imufusion",
 }
 
+# Paquetes que ya fallaron al instalarse, por intérprete. Sin esta caché, un
+# paquete incompilable (imufusion en el Python MinGW de MSYS2) se reintentaba
+# en CADA arranque y retrasaba la apertura de la app ~80s.
+_PIP_FAILURE_CACHE = os.path.join(os.path.expanduser("~"), ".video360_pip_failures.json")
+
+
+def _load_failed_installs():
+    try:
+        with open(_PIP_FAILURE_CACHE, encoding="utf-8") as f:
+            return set(json.load(f).get(sys.executable, []))
+    except Exception:
+        return set()
+
+
+def _record_failed_install(pip_name):
+    try:
+        data = {}
+        if os.path.isfile(_PIP_FAILURE_CACHE):
+            with open(_PIP_FAILURE_CACHE, encoding="utf-8") as f:
+                data = json.load(f)
+        failed = set(data.get(sys.executable, []))
+        failed.add(pip_name)
+        data[sys.executable] = sorted(failed)
+        with open(_PIP_FAILURE_CACHE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
 def auto_install_packages():
     """Instala paquetes pip faltantes automáticamente."""
     if getattr(sys, "frozen", False):
         # Ejecutable PyInstaller: dependencias empaquetadas, sys.executable no es Python
         return True
+    configure_console_utf8()
     missing = []
     for module_name, pip_name in REQUIRED_PACKAGES.items():
         try:
@@ -105,7 +148,17 @@ def auto_install_packages():
     if not missing:
         return True
 
+    already_failed = _load_failed_installs()
+    skipped = [p for _, p in missing if p in already_failed]
+    missing = [(m, p) for m, p in missing if p not in already_failed]
+    if skipped:
+        print(f"\n  ⚠ No se reintenta instalar {', '.join(skipped)} (falló antes en este "
+              f"Python — instálalo manualmente si lo necesitas)")
+    if not missing:
+        return False
+
     print(f"\n  Instalando dependencias: {', '.join(p for _, p in missing)}…")
+    all_ok = not skipped
     for module_name, pip_name in missing:
         try:
             subprocess.check_call(
@@ -124,8 +177,9 @@ def auto_install_packages():
                 print(f"  ✓ {pip_name} instalado")
             except Exception as e:
                 print(f"  ✗ Error instalando {pip_name}: {e}")
-                return False
-    return True
+                _record_failed_install(pip_name)
+                all_ok = False
+    return all_ok
 
 
 def find_ffmpeg():
@@ -1198,6 +1252,19 @@ class FrameExtractor:
             self.on_log(f"Prefijo '{self._prefix_input}' tiene caracteres inválidos para "
                         f"nombre de archivo → se usa '{self.prefix}'", "warn")
 
+        # ── piexif: obligatorio si se pidió EXIF ──
+        # Sin este check la app extraía todo, calculaba el GPS y dejaba las
+        # fotos SIN coordenadas con un warning enterrado al final (caso real:
+        # ejecutar con el Python de MSYS2, que no trae piexif).
+        if self.inject_exif and not HAS_PIEXIF:
+            self.on_log(f"piexif no está disponible en este Python: {sys.executable}", "err")
+            self.on_log("Sin piexif las fotos saldrían sin coordenadas GPS (solo CSV).", "err")
+            self.on_log("Solución: usa el .exe empaquetado, ejecuta con `py video360_frame_extractor.py`, "
+                        "o instala piexif en este Python (`python -m pip install piexif`). "
+                        "Para extraer sin EXIF a propósito: --no-exif.", "warn")
+            self.on_done(False, "piexif no disponible — se cancela para no generar fotos sin GPS")
+            return
+
         # ── FFmpeg ──
         if not self.ffmpeg_path:
             self.on_log("FFmpeg no encontrado", "err")
@@ -1857,18 +1924,6 @@ def run_gui():
 # ═══════════════════════════════════════════════
 # CLI MODE
 # ═══════════════════════════════════════════════
-def configure_console_utf8():
-    """Reconfigura stdout/stderr a UTF-8 con errors='replace'.
-    Las consolas Windows legacy (cp1252/cp850) no codifican los símbolos
-    ●✓⚠✗█░ del CLI y matarían el pipeline en el primer print.
-    """
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
-
 def run_cli():
     configure_console_utf8()
     print(f"\n{'='*55}\n  VIDEO 360 -> FRAMES GPS - Bureau Veritas v{VERSION} CLI\n{'='*55}\n")

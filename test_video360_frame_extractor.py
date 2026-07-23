@@ -256,7 +256,76 @@ class TestFrozenExecutable:
         assert llamadas == [], "auto_install invocó pip dentro de un exe congelado"
 
 
+class TestPiexifObligatorio:
+    """Caso real (ejercicio Ballenas 023/024/025): la app corrió con un Python
+    sin piexif (MSYS2), extrajo 330 frames en ~10 min y los dejó SIN GPS con
+    solo un warning enterrado en el log. Si el usuario pidió EXIF (default),
+    la falta de piexif debe ABORTAR al inicio, no degradar en silencio."""
+
+    def test_pipeline_aborta_sin_piexif_cuando_se_pide_exif(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(vfe, "HAS_PIEXIF", False)
+        ext = vfe.FrameExtractor("no_existe.mp4", "no_existe.gpx", str(tmp_path / "out"))
+        resultado = []
+        ext.on_done = lambda ok, msg: resultado.append((ok, msg))
+        ext.run()
+        assert resultado, "el pipeline no reportó resultado"
+        ok, msg = resultado[0]
+        assert ok is False
+        assert "piexif" in msg.lower()
+
+    def test_pipeline_no_aborta_por_piexif_con_no_exif(self, tmp_path, monkeypatch):
+        """Con --no-exif la falta de piexif es legítima: el pipeline sigue
+        (y fallará después por el GPX inexistente, no por piexif)."""
+        monkeypatch.setattr(vfe, "HAS_PIEXIF", False)
+        ext = vfe.FrameExtractor("no_existe.mp4", "no_existe.gpx", str(tmp_path / "out"),
+                                 inject_exif=False)
+        resultado = []
+        ext.on_done = lambda ok, msg: resultado.append((ok, msg))
+        ext.run()
+        assert resultado and resultado[0][0] is False
+        assert "piexif" not in resultado[0][1].lower()
+
+
 class TestConsoleUtf8:
+    def test_auto_install_fallido_no_revienta_en_cp1252(self, tmp_path, monkeypatch):
+        """Caso real (MSYS2 + consola cp1252): pip falla instalando imufusion y
+        el print del error con '✗' moría con UnicodeEncodeError ANTES de abrir
+        la app. auto_install debe reconfigurar la consola antes de imprimir."""
+        import io
+        import subprocess as sp
+        buf = io.BytesIO()
+        monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(buf, encoding="cp1252"))
+        monkeypatch.setattr(sys, "frozen", False, raising=False)
+        monkeypatch.setattr(vfe, "REQUIRED_PACKAGES", {"modulo_inexistente_xyz": "paquete-fantasma"})
+
+        def pip_falla(cmd, **kw):
+            raise sp.CalledProcessError(1, cmd)
+        monkeypatch.setattr(vfe.subprocess, "check_call", pip_falla)
+
+        assert vfe.auto_install_packages() is False   # no debe lanzar UnicodeEncodeError
+
+    def test_instalacion_fallida_no_se_reintenta_en_cada_arranque(self, tmp_path, monkeypatch):
+        """Caso real (MSYS2): imufusion no compila en MinGW y el reintento de
+        pip en cada arranque costaba ~80s ANTES de abrir la GUI. Un paquete que
+        ya falló en este intérprete se salta en arranques siguientes."""
+        import subprocess as sp
+        monkeypatch.setattr(vfe, "_PIP_FAILURE_CACHE", str(tmp_path / "fallos.json"))
+        monkeypatch.setattr(sys, "frozen", False, raising=False)
+        monkeypatch.setattr(vfe, "REQUIRED_PACKAGES", {"modulo_inexistente_xyz": "paquete-fantasma"})
+        llamadas = []
+
+        def pip_falla(cmd, **kw):
+            llamadas.append(cmd)
+            raise sp.CalledProcessError(1, cmd)
+        monkeypatch.setattr(vfe.subprocess, "check_call", pip_falla)
+
+        assert vfe.auto_install_packages() is False
+        n_primer_arranque = len(llamadas)
+        assert n_primer_arranque > 0, "el primer arranque debe intentar instalar"
+
+        assert vfe.auto_install_packages() is False   # segundo arranque
+        assert len(llamadas) == n_primer_arranque, "reintentó pip para un paquete ya fallido"
+
     def test_simbolos_no_revientan_en_consola_cp1252(self, monkeypatch):
         """Consolas Windows legacy (cp1252/cp850) no codifican ●✓✗█ — el CLI
         debe reconfigurar stdout para no morir en el primer log."""
